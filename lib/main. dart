@@ -1,0 +1,242 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:csv/csv.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:intl/intl.dart';
+
+void main() => runApp(const ReportApp());
+
+class ReportApp extends StatelessWidget {
+  const ReportApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: 'CSV Report Viewer',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal), useMaterial3: true),
+        home: const ReportHome(),
+      );
+}
+
+class ReportRow {
+  final String shop, bill, date, article, size;
+  final double qty, wholesale, billRate, mrp, difference, extraPercent, totalExtra;
+  ReportRow({required this.shop, required this.bill, required this.date,
+    required this.article, required this.size, required this.qty,
+    required this.wholesale, required this.billRate, required this.mrp,
+    required this.difference, required this.extraPercent, required this.totalExtra});
+}
+
+class ReportHome extends StatefulWidget {
+  const ReportHome({super.key});
+  @override
+  State<ReportHome> createState() => _ReportHomeState();
+}
+
+class _ReportHomeState extends State<ReportHome> {
+  List<ReportRow> _rows = [];
+  List<ReportRow> _filtered = [];
+  String _search = '';
+  String? _shopFilter;
+  String _fileName = '';
+  final _searchCtrl = TextEditingController();
+  final _money = NumberFormat('#,##0.00');
+
+  Future<void> _pickCsv() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(
+        type: FileType.custom, allowedExtensions: ['csv'], withData: true);
+      if (res == null || res.files.isEmpty) return;
+      final file = res.files.first;
+      String content = file.bytes != null
+          ? utf8.decode(file.bytes!, allowMalformed: true)
+          : await File(file.path!).readAsString();
+      if (content.startsWith('\uFEFF')) content = content.substring(1);
+
+      final parsed = const CsvToListConverter(shouldParseNumbers: false, eol: '\n').convert(content);
+      if (parsed.isEmpty) throw 'Empty CSV';
+
+      final header = parsed.first.map((e) => e.toString().trim().toLowerCase()).toList();
+      int idx(String n) => header.indexOf(n);
+      for (final r in ['shop','bill','date','article','size','qty','wholesale','billrate','mrp','difference','extrapercent','totalextra']) {
+        if (idx(r) < 0) throw 'Missing column: $r';
+      }
+
+      double d(dynamic v) {
+        if (v == null) return 0;
+        return double.tryParse(v.toString().replaceAll(',', '').trim()) ?? 0;
+      }
+
+      final list = <ReportRow>[];
+      for (var i = 1; i < parsed.length; i++) {
+        final r = parsed[i];
+        if (r.isEmpty || r.every((c) => c == null || c.toString().trim().isEmpty)) continue;
+        dynamic v(String key) {
+          final k = idx(key);
+          return k < r.length ? r[k] : null;
+        }
+        String s(String k) => (v(k) ?? '').toString().trim();
+        list.add(ReportRow(
+          shop: s('shop'), bill: s('bill'), date: s('date'),
+          article: s('article'), size: s('size'),
+          qty: d(v('qty')), wholesale: d(v('wholesale')),
+          billRate: d(v('billrate')), mrp: d(v('mrp')),
+          difference: d(v('difference')), extraPercent: d(v('extrapercent')),
+          totalExtra: d(v('totalextra')),
+        ));
+      }
+
+      setState(() {
+        _rows = list;
+        _fileName = file.name;
+        _shopFilter = null;
+        _search = '';
+        _searchCtrl.clear();
+        _applyFilter();
+      });
+    } catch (e) {
+      _snack('Import failed: $e');
+    }
+  }
+
+  void _applyFilter() {
+    final q = _search.toLowerCase();
+    _filtered = _rows.where((r) {
+      if (_shopFilter != null && r.shop != _shopFilter) return false;
+      if (q.isEmpty) return true;
+      return r.shop.toLowerCase().contains(q) ||
+          r.bill.toLowerCase().contains(q) ||
+          r.article.toLowerCase().contains(q) ||
+          r.date.toLowerCase().contains(q) ||
+          r.size.toLowerCase().contains(q);
+    }).toList();
+    setState(() {});
+  }
+
+  Future<void> _export() async {
+    if (_filtered.isEmpty) { _snack('Nothing to export'); return; }
+    final rows = <List<String>>[
+      ['Shop','Bill','Date','Article','Size','Qty','Wholesale','BillRate','MRP','Difference','ExtraPercent','TotalExtra'],
+      ..._filtered.map((r) => [r.shop, r.bill, r.date, r.article, r.size,
+        r.qty.toString(), r.wholesale.toString(), r.billRate.toString(),
+        r.mrp.toString(), r.difference.toString(), r.extraPercent.toString(), r.totalExtra.toString()])
+    ];
+    final csvStr = const ListToCsvConverter().convert(rows);
+    try {
+      await Share.shareXFiles([XFile.fromData(utf8.encode(csvStr),
+          name: 'report_export.csv', mimeType: 'text/csv')]);
+    } catch (e) { _snack('Export failed: $e'); }
+  }
+
+  void _snack(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  double get _totalQty => _filtered.fold(0.0, (a, r) => a + r.qty);
+  double get _totalDiff => _filtered.fold(0.0, (a, r) => a + r.difference);
+  double get _totalExtra => _filtered.fold(0.0, (a, r) => a + r.totalExtra);
+
+  @override
+  Widget build(BuildContext context) {
+    final shops = _rows.map((r) => r.shop).toSet().toList()..sort();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_fileName.isEmpty ? 'CSV Report Viewer' : _fileName,
+            overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(icon: const Icon(Icons.upload_file), tooltip: 'Import CSV', onPressed: _pickCsv),
+          IconButton(icon: const Icon(Icons.ios_share), tooltip: 'Export filtered', onPressed: _export),
+        ],
+      ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(8),
+          child: Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _searchCtrl,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  hintText: 'Search shop / bill / article...',
+                  border: OutlineInputBorder(), isDense: true),
+                onChanged: (v) { _search = v; _applyFilter(); },
+              ),
+            ),
+            const SizedBox(width: 8),
+            DropdownButton<String?>(
+              value: _shopFilter,
+              hint: const Text('Shop'),
+              items: [
+                const DropdownMenuItem<String?>(value: null, child: Text('All shops')),
+                ...shops.map((s) => DropdownMenuItem<String?>(value: s, child: Text(s))),
+              ],
+              onChanged: (v) { _shopFilter = v; _applyFilter(); },
+            ),
+          ]),
+        ),
+        Expanded(
+          child: _filtered.isEmpty
+              ? Center(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.table_chart, size: 64, color: Colors.grey),
+                    const SizedBox(height: 12),
+                    Text(_rows.isEmpty ? 'Import a CSV to begin' : 'No rows match the filter',
+                        style: const TextStyle(color: Colors.grey, fontSize: 16)),
+                  ]),
+                )
+              : SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.vertical,
+                    child: DataTable(
+                      columns: const [
+                        DataColumn(label: Text('Shop')),
+                        DataColumn(label: Text('Bill')),
+                        DataColumn(label: Text('Date')),
+                        DataColumn(label: Text('Article')),
+                        DataColumn(label: Text('Size')),
+                        DataColumn(label: Text('Qty'), numeric: true),
+                        DataColumn(label: Text('Wholesale'), numeric: true),
+                        DataColumn(label: Text('BillRate'), numeric: true),
+                        DataColumn(label: Text('MRP'), numeric: true),
+                        DataColumn(label: Text('Difference'), numeric: true),
+                        DataColumn(label: Text('Extra%'), numeric: true),
+                        DataColumn(label: Text('TotalExtra'), numeric: true),
+                      ],
+                      rows: _filtered.map((r) => DataRow(cells: [
+                        DataCell(Text(r.shop)),
+                        DataCell(Text(r.bill)),
+                        DataCell(Text(r.date)),
+                        DataCell(Text(r.article)),
+                        DataCell(Text(r.size)),
+                        DataCell(Text(r.qty.toString())),
+                        DataCell(Text(_money.format(r.wholesale))),
+                        DataCell(Text(_money.format(r.billRate))),
+                        DataCell(Text(_money.format(r.mrp))),
+                        DataCell(Text(_money.format(r.difference))),
+                        DataCell(Text(r.extraPercent.toString())),
+                        DataCell(Text(_money.format(r.totalExtra))),
+                      ])).toList(),
+                    ),
+                  ),
+                ),
+        ),
+        Container(
+          color: Colors.teal.shade50,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            Text('Rows: ${_filtered.length}', style: const TextStyle(fontWeight: FontWeight.w600)),
+            Text('Qty: ${_money.format(_totalQty)}'),
+            Text('Diff: ${_money.format(_totalDiff)}'),
+            Text('Extra: ${_money.format(_totalExtra)}', style: const TextStyle(fontWeight: FontWeight.bold)),
+          ]),
+        ),
+      ]),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _pickCsv,
+        icon: const Icon(Icons.file_open),
+        label: const Text('Import CSV'),
+      ),
+    );
+  }
+}
